@@ -46,7 +46,7 @@ User invokes slash command in VS Code
 
 **File-based communication:** Agents communicate exclusively via files:
 - Planner writes `spec.md`
-- Generator writes `sprint-contract.md` and `harness/handoff.md`
+- Generator writes `sprint-contract-NN.md` (numbered per sprint) and `harness/handoff.md`
 - Evaluator writes `harness/eval-report.md`
 
 ### Sprint Contracts
@@ -89,7 +89,7 @@ Note: Placed in `commands/` alongside existing ForgeProof commands (`forgeproof.
 | File | Created by | Purpose |
 |------|-----------|---------|
 | `spec.md` | Planner | Product specification |
-| `sprint-contract.md` | Generator | Testable success criteria for current sprint |
+| `sprint-contract-NN.md` | Generator | Testable success criteria for sprint NN (numbered per sprint: `sprint-contract-01.md`, `sprint-contract-02.md`, etc.) |
 | `harness/handoff.md` | Generator | Structured handoff between phases |
 | `harness/eval-report.md` | Evaluator | Scores, PASS/FAIL, bug reports |
 
@@ -159,15 +159,20 @@ Note: The slash commands in `commands/` are canonical. The `harness/*.md` files 
 3. Tech constraints: Python 3.11+ stdlib only, `from rpb.X import Y` imports, TOML config via tomllib
 4. Code style: Type hints, one-line docstrings on public functions, no classes where functions suffice, pathlib, f-strings, no bare except
 5. Git discipline: Commit after each feature, conventional prefixes (feat:/fix:/etc.), never commit broken code
-6. Sprint contracts: Before starting each major feature, write a sprint contract to `sprint-contract.md` — a list of what you will build and the specific, testable criteria that define success. Each criterion should be concrete enough that an independent Evaluator can verify it.
+6. Sprint contracts: Before starting each major feature, write a sprint contract to `sprint-contract-NN.md` (numbered sequentially: `sprint-contract-01.md`, `sprint-contract-02.md`, etc.) — a list of what you will build and the specific, testable criteria that define success. Each criterion should be concrete enough that an independent Evaluator can verify it. Never overwrite a previous sprint contract.
 7. Self-check: Do a quick self-check against the sprint contract before writing the handoff. Fix anything obviously broken. This is not a substitute for independent evaluation — proceed to the Evaluator regardless of what you find.
 8. Instructions: Read spec.md, implement in order, test as you go, commit after each feature
 9. Handoff: After each major feature, write/update `harness/handoff.md` using the template from `harness/handoff-template.md`
 10. Context anxiety: If you notice yourself rushing to finish or cutting scope, stop. Write a handoff artifact and tell the user to start a new conversation and re-run `/harness-generate`.
-11. Anti-rules: Do NOT modify files outside this repo. Do NOT add pip dependencies. Do NOT wrap up early. Do NOT simplify the spec to fit within a session.
-12. Exit: "Start a new conversation and run `/harness-evaluate`"
+11. Mid-sprint context exhaustion: If you hit context limits mid-sprint (not at a clean sprint boundary):
+    - Commit all working code so far (even if the feature is incomplete)
+    - In `harness/handoff.md`, clearly mark the sprint as **"mid-sprint resume"** (not "sprint complete") and list: what's done, what's partially done, and what's untouched from the sprint contract
+    - Preserve the current sprint contract — do NOT overwrite it. The next Generator session resumes against the same contract.
+    - Tell the user: "Sprint N is incomplete. Start a new conversation and re-run `/harness-generate` to resume."
+12. Anti-rules: Do NOT modify files outside this repo. Do NOT add pip dependencies. Do NOT wrap up early. Do NOT simplify the spec to fit within a session.
+13. Exit: "Start a new conversation and run `/harness-evaluate`"
 
-**Output artifacts:** Implementation code + `sprint-contract.md` + `harness/handoff.md`
+**Output artifacts:** Implementation code + `sprint-contract-NN.md` + `harness/handoff.md`
 
 ### `/harness-evaluate`
 
@@ -177,7 +182,7 @@ Note: The slash commands in `commands/` are canonical. The `harness/*.md` files 
 
 **Prompt structure:**
 1. Role: "You are a skeptical QA engineer. Your job is to find problems, not praise. Default stance: assume it's broken until proven otherwise."
-2. Context loading: Read `spec.md`, `sprint-contract.md`, `harness/criteria.md`, `harness/handoff.md`
+2. Context loading: Read the current sprint contract (`sprint-contract-NN.md` — the highest-numbered one), `harness/criteria.md`, and `harness/handoff.md`. Only consult `spec.md` for scope questions — do not re-read the entire spec upfront. Focus context on the current sprint's contract and handoff to preserve window space for actual testing.
 3. Step 1 — Smoke test:
    - `python -m ruff check lib/`
    - `python -c "import sys; sys.path.insert(0, 'lib'); from rpb.ed25519 import sign, derive_public_key; print('RPB OK')"`
@@ -187,7 +192,7 @@ Note: The slash commands in `commands/` are canonical. The `harness/*.md` files 
 4. Step 2 — Unit test coverage check
 5. Step 3 — Integration tests (decision log hash chain, Ed25519 round-trip, config loading)
 6. Step 4 — Command prompt review (read `commands/*.md` — both ForgeProof skill commands and harness commands)
-7. Step 5 — Sprint contract verification: test every criterion in `sprint-contract.md`. Do not skip criteria or mark them as passed without direct verification. A contracted item that isn't implemented is a Critical bug.
+7. Step 5 — Sprint contract verification: test every criterion in the current sprint contract (`sprint-contract-NN.md`). Do not skip criteria or mark them as passed without direct verification. A contracted item that isn't implemented is a Critical bug.
 8. Step 6 — Grade against `harness/criteria.md` using these 5 criteria (scored 1-10):
 
    | Criterion | Weight | Threshold | What it measures |
@@ -212,7 +217,7 @@ Note: The slash commands in `commands/` are canonical. The `harness/*.md` files 
 
 **Prompt structure:**
 1. Role: Same as Generator
-2. Context: Read `spec.md`, `sprint-contract.md`, `harness/eval-report.md`, and source files referenced in bugs
+2. Context: Read the current sprint contract (`sprint-contract-NN.md`), `harness/eval-report.md`, and source files referenced in bugs. Consult `spec.md` only for scope questions.
 3. Instructions: Fix all bugs listed in eval-report.md, prioritizing Critical → Major → Minor → Nit
 4. Git discipline: Same as Generator (commit after each fix)
 5. Self-check: Quick sanity check against the sprint contract after fixes. Not a substitute for re-evaluation.
@@ -246,8 +251,8 @@ Add the following section:
 ## Harness Commands (Three-Agent Architecture)
 
 - `/harness-plan <brief>` — Planner: converts brief into spec.md
-- `/harness-generate` — Generator: implements spec.md, writes sprint-contract.md + harness/handoff.md
-- `/harness-evaluate` — Evaluator: tests against sprint contract + criteria, writes harness/eval-report.md
+- `/harness-generate` — Generator: implements spec.md, writes sprint-contract-NN.md + harness/handoff.md
+- `/harness-evaluate` — Evaluator: tests against current sprint contract + criteria, writes harness/eval-report.md
 - `/harness-fix` — Generator fix pass: addresses bugs from eval-report.md
 
 **Workflow:** Plan → review spec → Generate (with sprint contracts) → Evaluate → Fix (if needed) → re-Evaluate
@@ -276,7 +281,7 @@ Add the following section:
 ## Acceptance Criteria
 
 1. `/harness-plan "test brief"` produces a well-structured `spec.md` with all required sections
-2. `/harness-generate` reads `spec.md`, writes `sprint-contract.md` before building, implements code with git commits, and writes `harness/handoff.md`
+2. `/harness-generate` reads `spec.md`, writes numbered `sprint-contract-NN.md` before building, implements code with git commits, and writes `harness/handoff.md`
 3. `/harness-evaluate` reads sprint contract, runs smoke tests, grades against 5 domain criteria, writes `harness/eval-report.md`
 4. `/harness-fix` reads eval-report bugs and fixes them with commits
 5. Each command's pre-flight check rejects missing prerequisites with a helpful message
@@ -285,3 +290,4 @@ Add the following section:
 8. CLAUDE.md documents the harness workflow
 9. Generator includes context anxiety detection and handoff instructions
 10. Evaluator tests every sprint contract criterion and fails unimplemented items as Critical bugs
+11. Generator handles mid-sprint context exhaustion by committing partial work, marking handoff as "mid-sprint resume", and preserving the sprint contract for the next session
