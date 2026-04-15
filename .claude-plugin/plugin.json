@@ -19,9 +19,9 @@
     "signing",
     "verification"
   ],
-  "repository": "https://github.com/ryanmichie/forgeproof",
-  "homepage": "https://github.com/ryanmichie/forgeproof",
-  "bugs": "https://github.com/ryanmichie/forgeproof/issues",
+  "repository": "https://github.com/ryanjmichie-git/ForgeProof_Skill",
+  "homepage": "https://github.com/ryanjmichie-git/ForgeProof_Skill",
+  "bugs": "https://github.com/ryanjmichie-git/ForgeProof_Skill/issues",
   "skills": [
     "forgeproof",
     "forgeproof-push",
