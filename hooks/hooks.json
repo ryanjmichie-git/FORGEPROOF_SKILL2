@@ -1,0 +1,26 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash(gh pr create)",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "if ls .forgeproof/*.rpack 1>/dev/null 2>&1; then echo 'ALLOW: .rpack bundle found'; exit 0; else echo 'BLOCK: No .rpack bundle found in .forgeproof/. Run /forgeproof first to generate a provenance bundle, then use /forgeproof-push to create the PR.'; exit 1; fi",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Edit|Write",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python ${CLAUDE_PLUGIN_ROOT}/skills/forgeproof/scripts/forgeproof.py lint --quiet 2>&1 | head -20 || true",
+          "timeout": 30
+        }
+      ]
+    }
+  ]
+}

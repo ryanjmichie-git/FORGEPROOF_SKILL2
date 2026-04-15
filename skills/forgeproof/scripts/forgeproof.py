@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+"""ForgeProof — Ed25519-signed SHA-256 hash chain provenance engine.
+
+Python 3.11+ stdlib only. No pip dependencies.
+Cryptographic signing via ssh-keygen (OpenSSH 8.0+).
+
+Subcommands:
+    preflight   Check core dependencies (gh, ssh-keygen, python)
+    detect      Detect project language and toolchain, output JSON
+    init        Create genesis block for an issue
+    record      Add a block to the chain
+    finalize    Finalize chain and build .rpack bundle
+    verify      Verify a .rpack bundle's integrity
+    summary     Output PR-ready summary for an issue
+    issues      List open GitHub issues assigned to current user
+    lint        Run detected linter (used by PostToolUse hook)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CHAIN_DIR = Path(".forgeproof")
+RPACK_VERSION = "1.0.0"
+RPACK_FORMAT = "forgeproof-rpack"
+GENESIS_PREV_HASH = "0" * 64
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def sha256_hex(data: str) -> str:
+    """Return hex SHA-256 digest of a UTF-8 string."""
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    """Return hex SHA-256 digest of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def canonical_json(obj: Any) -> str:
+    """Deterministic JSON serialization (sorted keys, no extra whitespace)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def now_iso() -> str:
+    """Current UTC time in ISO 8601."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def die(msg: str, code: int = 1) -> None:
+    """Print error to stderr and exit."""
+    print(f"forgeproof: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    """Print info to stderr (keeps stdout clean for JSON output)."""
+    print(f"forgeproof: {msg}", file=sys.stderr)
+
+
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run a subprocess, returning the result."""
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+def shell_run(cmd: str, **kwargs) -> subprocess.CompletedProcess:
+    """Run a shell command string cross-platform (uses system shell, not sh -c)."""
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Signing
+# ---------------------------------------------------------------------------
+
+
+def generate_ephemeral_keypair(issue: str) -> tuple[Path, Path]:
+    """Generate an ephemeral Ed25519 keypair in /tmp. Returns (private, public)."""
+    private = Path(tempfile.gettempdir()) / f"forgeproof_{issue}_ed25519"
+    public = Path(f"{private}.pub")
+    # Remove existing files to avoid ssh-keygen prompt
+    private.unlink(missing_ok=True)
+    public.unlink(missing_ok=True)
+    result = run(["ssh-keygen", "-t", "ed25519", "-f", str(private), "-N", "", "-q"])
+    if result.returncode != 0:
+        die(f"ssh-keygen failed: {result.stderr.strip()}")
+    return private, public
+
+
+def sign_ed25519(message: str, key_path: Path) -> str:
+    """Sign a message string using ssh-keygen -Y sign. Returns the signature blob."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".dat", delete=False) as f:
+        f.write(message)
+        f.flush()
+        data_path = Path(f.name)
+
+    try:
+        result = run([
+            "ssh-keygen", "-Y", "sign",
+            "-f", str(key_path),
+            "-n", "forgeproof",
+            str(data_path),
+        ])
+        sig_path = Path(f"{data_path}.sig")
+        if result.returncode != 0 or not sig_path.exists():
+            die(f"Signing failed: {result.stderr.strip()}")
+        signature = sig_path.read_text().strip()
+        sig_path.unlink(missing_ok=True)
+        return signature
+    finally:
+        data_path.unlink(missing_ok=True)
+
+
+def verify_signature(message: str, signature: str, public_key: str) -> bool:
+    """Verify an ssh-keygen signature against a public key string."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        # Write data to verify
+        data_path = tmpdir / "data.dat"
+        data_path.write_text(message)
+        # Write signature
+        sig_path = tmpdir / "data.dat.sig"
+        sig_path.write_text(signature)
+        # Write allowed signers file (principal = "forgeproof")
+        allowed_path = tmpdir / "allowed_signers"
+        allowed_path.write_text(f"forgeproof {public_key}\n")
+
+        result = run([
+            "ssh-keygen", "-Y", "verify",
+            "-f", str(allowed_path),
+            "-I", "forgeproof",
+            "-n", "forgeproof",
+            "-s", str(sig_path),
+        ], input=message)
+        return result.returncode == 0
+
+
+def read_public_key(pub_path: Path) -> str:
+    """Read the public key string from a .pub file."""
+    return pub_path.read_text().strip()
+
+
+def delete_private_key(private_path: Path) -> None:
+    """Securely delete the ephemeral private key."""
+    private_path.unlink(missing_ok=True)
+    # Also remove the public key file from /tmp (it's embedded in the bundle)
+    pub = Path(f"{private_path}.pub")
+    pub.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Chain operations
+# ---------------------------------------------------------------------------
+
+
+def chain_path(issue: str) -> Path:
+    """Path to the chain file for an issue."""
+    return CHAIN_DIR / f"chain-{issue}.json"
+
+
+def load_chain(issue: str) -> list[dict]:
+    """Load an existing chain or die if it doesn't exist."""
+    path = chain_path(issue)
+    if not path.exists():
+        die(f"No chain found for issue {issue}. Run 'init' first.")
+    return json.loads(path.read_text())
+
+
+def save_chain(issue: str, chain: list[dict]) -> None:
+    """Write chain to disk."""
+    CHAIN_DIR.mkdir(exist_ok=True)
+    chain_path(issue).write_text(json.dumps(chain, indent=2) + "\n")
+
+
+def build_block(
+    index: int,
+    action: str,
+    data: dict,
+    prev_hash: str,
+    key_path: Path | None,
+) -> dict:
+    """Construct a new block, compute its hash, and optionally sign it."""
+    block = {
+        "index": index,
+        "timestamp": now_iso(),
+        "action": action,
+        "data": data,
+        "prev_hash": prev_hash,
+    }
+    # Hash = SHA-256 of canonical JSON of block (without hash and signature)
+    block_hash = sha256_hex(canonical_json(block))
+    block["hash"] = block_hash
+
+    # Sign if key is available
+    if key_path and key_path.exists():
+        block["signature"] = sign_ed25519(block_hash, key_path)
+    else:
+        block["signature"] = ""
+
+    return block
+
+
+def get_key_path(issue: str) -> Path | None:
+    """Return the ephemeral private key path if it exists."""
+    key = Path(tempfile.gettempdir()) / f"forgeproof_{issue}_ed25519"
+    return key if key.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: preflight
+# ---------------------------------------------------------------------------
+
+
+def cmd_preflight(_args: argparse.Namespace) -> None:
+    """Check that all core dependencies are available."""
+    checks: list[dict] = []
+
+    # gh CLI
+    has_gh = shutil.which("gh") is not None
+    gh_version = None
+    if has_gh:
+        result = run(["gh", "--version"])
+        gh_version = result.stdout.strip().split("\n")[0] if result.returncode == 0 else None
+    checks.append({
+        "dependency": "gh",
+        "ok": has_gh,
+        "version": gh_version,
+        "install": "https://cli.github.com/",
+    })
+
+    # gh auth
+    gh_auth_ok = False
+    gh_auth_detail = "gh not installed"
+    if has_gh:
+        result = run(["gh", "auth", "status"])
+        gh_auth_ok = result.returncode == 0
+        gh_auth_detail = "authenticated" if gh_auth_ok else result.stderr.strip()
+    checks.append({
+        "dependency": "gh-auth",
+        "ok": gh_auth_ok,
+        "detail": gh_auth_detail,
+        "install": "Run: gh auth login",
+    })
+
+    # ssh-keygen
+    result = run(["ssh-keygen", "-h"])
+    # ssh-keygen -h exits non-zero but outputs to stderr; check if binary exists
+    has_sshkeygen = shutil.which("ssh-keygen") is not None
+    checks.append({
+        "dependency": "ssh-keygen",
+        "ok": has_sshkeygen,
+        "install": "Install OpenSSH 8.0+ (included on macOS/Linux)",
+    })
+
+    # Python version
+    v = sys.version_info
+    py_ok = v.major == 3 and v.minor >= 11
+    checks.append({
+        "dependency": "python",
+        "ok": py_ok,
+        "version": f"{v.major}.{v.minor}.{v.micro}",
+        "install": "Python 3.11+ required: https://python.org",
+    })
+
+    all_ok = all(c["ok"] for c in checks)
+    output = {"ok": all_ok, "checks": checks}
+    print(json.dumps(output, indent=2))
+    sys.exit(0 if all_ok else 1)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: detect
+# ---------------------------------------------------------------------------
+
+TOOLCHAIN_MAP = {
+    "python": {
+        "config_files": ["pyproject.toml", "setup.cfg", "setup.py", "requirements.txt"],
+        "test_runners": [
+            {"name": "pytest", "command": "python -m pytest", "check": "python -m pytest --version 2>/dev/null || python3 -m pytest --version 2>/dev/null"},
+        ],
+        "linters": [
+            {"name": "ruff", "command": "python -m ruff check .", "check": "python -m ruff --version 2>/dev/null || python3 -m ruff --version 2>/dev/null"},
+            {"name": "flake8", "command": "python -m flake8 .", "check": "python -m flake8 --version 2>/dev/null || python3 -m flake8 --version 2>/dev/null"},
+        ],
+        "runtime_check": "python --version 2>/dev/null || python3 --version 2>/dev/null",
+    },
+    "javascript": {
+        "config_files": ["package.json"],
+        "test_runners": [
+            {"name": "jest", "command": "npx jest", "check": "npx jest --version 2>/dev/null"},
+            {"name": "vitest", "command": "npx vitest run", "check": "npx vitest --version 2>/dev/null"},
+            {"name": "mocha", "command": "npx mocha", "check": "npx mocha --version 2>/dev/null"},
+        ],
+        "linters": [
+            {"name": "eslint", "command": "npx eslint .", "check": "npx eslint --version 2>/dev/null"},
+        ],
+        "runtime_check": "which node",
+    },
+    "go": {
+        "config_files": ["go.mod"],
+        "test_runners": [
+            {"name": "go test", "command": "go test ./...", "check": "go version"},
+        ],
+        "linters": [
+            {"name": "golangci-lint", "command": "golangci-lint run", "check": "which golangci-lint"},
+        ],
+        "runtime_check": "which go",
+    },
+}
+
+
+def cmd_detect(args: argparse.Namespace) -> None:
+    """Detect project language and available toolchain."""
+    project_root = Path(args.project_root) if args.project_root else Path.cwd()
+    detected: list[dict] = []
+
+    for lang, spec in TOOLCHAIN_MAP.items():
+        # Check if any config file exists
+        config_found = [f for f in spec["config_files"] if (project_root / f).exists()]
+        if not config_found:
+            continue
+
+        # Check runtime
+        runtime_ok = shell_run(spec["runtime_check"]).returncode == 0
+
+        # Find first available test runner
+        test_runner = None
+        for runner in spec["test_runners"]:
+            if shell_run(runner["check"]).returncode == 0:
+                test_runner = {"name": runner["name"], "command": runner["command"]}
+                break
+        # If no runner found via check, default to the first one
+        if not test_runner and spec["test_runners"]:
+            test_runner = {
+                "name": spec["test_runners"][0]["name"],
+                "command": spec["test_runners"][0]["command"],
+                "available": False,
+            }
+
+        # Find first available linter
+        linter = None
+        for l in spec["linters"]:
+            if shell_run(l["check"]).returncode == 0:
+                linter = {"name": l["name"], "command": l["command"]}
+                break
+
+        detected.append({
+            "language": lang,
+            "config_files": config_found,
+            "runtime_available": runtime_ok,
+            "test_runner": test_runner,
+            "linter": linter,
+        })
+
+    if not detected:
+        output = {
+            "detected": False,
+            "languages": [],
+            "message": "No supported project configuration found. Looked for: "
+                       + ", ".join(f for spec in TOOLCHAIN_MAP.values() for f in spec["config_files"]),
+        }
+    else:
+        output = {"detected": True, "languages": detected}
+
+    print(json.dumps(output, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: init
+# ---------------------------------------------------------------------------
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Initialize a provenance chain for an issue."""
+    issue = args.issue
+    path = chain_path(issue)
+
+    if path.exists():
+        if getattr(args, "force", False):
+            # Clean up prior run state
+            path.unlink(missing_ok=True)
+            rpack = CHAIN_DIR / f"issue-{issue}.rpack"
+            rpack.unlink(missing_ok=True)
+            key = Path(tempfile.gettempdir()) / f"forgeproof_{issue}_ed25519"
+            key.unlink(missing_ok=True)
+            Path(f"{key}.pub").unlink(missing_ok=True)
+            info(f"Cleaned up prior state for issue {issue}")
+        else:
+            die(f"Chain already exists for issue {issue}: {path}. Use --force to overwrite.")
+
+    # Generate ephemeral keypair
+    private_key, public_key = generate_ephemeral_keypair(issue)
+    info(f"Generated ephemeral keypair for issue {issue}")
+
+    # Parse optional requirements and title from --data
+    data = json.loads(args.data) if args.data else {}
+    genesis_data = {
+        "issue": int(issue),
+        "title": data.get("title", ""),
+        "requirements": data.get("requirements", []),
+    }
+
+    # Build genesis block
+    genesis = build_block(
+        index=0,
+        action="genesis",
+        data=genesis_data,
+        prev_hash=GENESIS_PREV_HASH,
+        key_path=private_key,
+    )
+
+    save_chain(issue, [genesis])
+    info(f"Initialized chain: {path}")
+
+    # Output result
+    result = {
+        "chain_file": str(path),
+        "genesis_hash": genesis["hash"],
+        "public_key": read_public_key(public_key),
+        "key_path": str(private_key),
+    }
+    print(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: record
+# ---------------------------------------------------------------------------
+
+
+def cmd_record(args: argparse.Namespace) -> None:
+    """Record a new block in the chain."""
+    issue = args.issue
+    chain = load_chain(issue)
+
+    # Parse data
+    try:
+        data = json.loads(args.data)
+    except json.JSONDecodeError as e:
+        die(f"Invalid JSON in --data: {e}")
+
+    # Validate action
+    valid_actions = [
+        "branch-create", "file-edit", "decision",
+        "test-result", "lint-result",
+    ]
+    if args.action not in valid_actions:
+        die(f"Invalid action '{args.action}'. Must be one of: {', '.join(valid_actions)}")
+
+    last_block = chain[-1]
+    key_path = get_key_path(issue)
+
+    block = build_block(
+        index=last_block["index"] + 1,
+        action=args.action,
+        data=data,
+        prev_hash=last_block["hash"],
+        key_path=key_path,
+    )
+
+    chain.append(block)
+    save_chain(issue, chain)
+
+    result = {
+        "index": block["index"],
+        "action": block["action"],
+        "hash": block["hash"],
+        "chain_length": len(chain),
+    }
+    print(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: finalize
+# ---------------------------------------------------------------------------
+
+
+def cmd_finalize(args: argparse.Namespace) -> None:
+    """Finalize the chain and build the .rpack bundle."""
+    issue = args.issue
+    chain = load_chain(issue)
+    key_path = get_key_path(issue)
+    if not key_path:
+        die(f"No ephemeral key found for issue {issue}. Was the chain initialized in this session?")
+
+    pub_path = Path(f"{key_path}.pub")
+    if not pub_path.exists():
+        die(f"Public key not found: {pub_path}")
+
+    public_key = read_public_key(pub_path)
+
+    # Build finalize block
+    last_block = chain[-1]
+    finalize_data = {
+        "commit_sha": args.commit,
+        "chain_length": len(chain) + 1,  # including the finalize block itself
+    }
+
+    finalize_block = build_block(
+        index=last_block["index"] + 1,
+        action="finalize",
+        data=finalize_data,
+        prev_hash=last_block["hash"],
+        key_path=key_path,
+    )
+
+    chain.append(finalize_block)
+    save_chain(issue, chain)
+
+    # Extract data from chain for the bundle
+    genesis = chain[0]
+    issue_data = genesis["data"]
+
+    # Collect artifacts, decisions, and evaluation data from chain
+    artifacts = []
+    decisions = []
+    test_results = []
+    lint_results = []
+
+    for block in chain:
+        action = block["action"]
+        d = block["data"]
+        if action == "file-edit":
+            artifacts.append({
+                "path": d.get("path", ""),
+                "operation": d.get("operation", ""),
+                "sha256": d.get("sha256", ""),
+            })
+        elif action == "decision":
+            decisions.append({
+                "context": d.get("context", ""),
+                "choice": d.get("choice", ""),
+                "rationale": d.get("rationale", ""),
+            })
+        elif action == "test-result":
+            test_results.append(d)
+        elif action == "lint-result":
+            lint_results.append(d)
+
+    # Compute evaluation status
+    total_passed = sum(t.get("passed", 0) for t in test_results)
+    total_failed = sum(t.get("failed", 0) for t in test_results)
+    total_lint_errors = sum(l.get("errors", 0) for l in lint_results)
+
+    # Collect coverage and failure info
+    all_coverage = {}
+    for t in test_results:
+        for req_id, tests in t.get("coverage", {}).items():
+            all_coverage.setdefault(req_id, []).extend(tests)
+
+    all_reqs = issue_data.get("requirements", [])
+    req_ids = []
+    for r in all_reqs:
+        if isinstance(r, str) and ":" in r:
+            req_ids.append(r.split(":")[0].strip())
+        elif isinstance(r, dict):
+            req_ids.append(r.get("id", ""))
+
+    uncovered = [rid for rid in req_ids if rid not in all_coverage] if req_ids else []
+    failed_tests = []
+    for t in test_results:
+        failed_tests.extend(t.get("failed_tests", []))
+
+    if total_failed == 0 and total_lint_errors == 0 and not uncovered:
+        eval_status = "pass"
+    elif total_passed == 0 and total_failed > 0:
+        eval_status = "fail"
+    else:
+        eval_status = "partial"
+
+    coverage_pct = "0%"
+    if req_ids:
+        covered_count = len(req_ids) - len(uncovered)
+        coverage_pct = f"{round(covered_count / len(req_ids) * 100)}%"
+
+    # Get repo URL from gh if available
+    repo_url = ""
+    if shutil.which("gh"):
+        gh_result = run(["gh", "repo", "view", "--json", "url", "-q", ".url"])
+        if gh_result.returncode == 0:
+            repo_url = gh_result.stdout.strip()
+
+    # Build requirements list for bundle
+    bundle_reqs = []
+    for r in all_reqs:
+        if isinstance(r, str) and ":" in r:
+            rid, rtext = r.split(":", 1)
+            rid = rid.strip()
+            rtext = rtext.strip()
+        elif isinstance(r, dict):
+            rid = r.get("id", "")
+            rtext = r.get("text", "")
+        else:
+            continue
+        status = "covered" if rid in all_coverage else "uncovered"
+        bundle_reqs.append({
+            "id": rid,
+            "text": rtext,
+            "status": status,
+            "tests": all_coverage.get(rid, []),
+        })
+
+    # Assemble the bundle (without root_digest and signature yet)
+    bundle = {
+        "version": RPACK_VERSION,
+        "format": RPACK_FORMAT,
+        "issue": {
+            "number": issue_data.get("issue", int(issue)),
+            "title": issue_data.get("title", ""),
+            "url": f"{repo_url}/issues/{issue}" if repo_url else "",
+        },
+        "requirements": bundle_reqs,
+        "artifacts": artifacts,
+        "decisions": decisions,
+        "evaluation": {
+            "status": eval_status,
+            "tests_passed": total_passed,
+            "tests_failed": total_failed,
+            "lint_errors": total_lint_errors,
+            "requirement_coverage": coverage_pct,
+            "uncovered_requirements": uncovered,
+            "failed_tests": failed_tests,
+        },
+        "chain_hash": sha256_hex(chain_path(issue).read_text()),
+        "public_key": public_key,
+    }
+
+    # Compute root digest over the bundle content
+    root_digest = sha256_hex(canonical_json(bundle))
+    bundle["root_digest"] = root_digest
+
+    # Sign the root digest
+    bundle["signature"] = sign_ed25519(root_digest, key_path)
+
+    # Write the .rpack file
+    CHAIN_DIR.mkdir(exist_ok=True)
+    rpack_path = CHAIN_DIR / f"issue-{issue}.rpack"
+    rpack_path.write_text(json.dumps(bundle, indent=2) + "\n")
+
+    # Delete ephemeral private key
+    delete_private_key(key_path)
+    info(f"Ephemeral private key deleted")
+
+    result = {
+        "rpack_path": str(rpack_path),
+        "root_digest": root_digest,
+        "evaluation_status": eval_status,
+        "chain_length": len(chain),
+        "artifacts_count": len(artifacts),
+        "requirements_count": len(bundle_reqs),
+    }
+    print(json.dumps(result, indent=2))
+    info(f"Bundle written: {rpack_path}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: verify
+# ---------------------------------------------------------------------------
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Verify a .rpack bundle's integrity."""
+    rpack_path = Path(args.rpack)
+    if not rpack_path.exists():
+        die(f"Bundle not found: {rpack_path}")
+
+    bundle = json.loads(rpack_path.read_text())
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # 1. Check format and version
+    if bundle.get("format") != RPACK_FORMAT:
+        errors.append(f"Unknown format: {bundle.get('format')}")
+    if bundle.get("version") != RPACK_VERSION:
+        warnings.append(f"Version mismatch: expected {RPACK_VERSION}, got {bundle.get('version')}")
+
+    # 2. Verify root digest
+    stored_digest = bundle.get("root_digest", "")
+    stored_signature = bundle.get("signature", "")
+    public_key = bundle.get("public_key", "")
+
+    # Recompute root digest: hash the bundle without root_digest and signature
+    bundle_for_hash = {k: v for k, v in bundle.items() if k not in ("root_digest", "signature")}
+    computed_digest = sha256_hex(canonical_json(bundle_for_hash))
+
+    if computed_digest != stored_digest:
+        errors.append(f"Root digest mismatch: computed {computed_digest[:16]}..., stored {stored_digest[:16]}...")
+    else:
+        info("Root digest: OK")
+
+    # 3. Verify signature
+    if stored_signature and public_key:
+        sig_ok = verify_signature(stored_digest, stored_signature, public_key)
+        if not sig_ok:
+            errors.append("Ed25519 signature verification FAILED")
+        else:
+            info("Signature: OK")
+    elif not stored_signature:
+        warnings.append("No signature present in bundle")
+
+    # 4. Verify chain hash
+    issue_num = str(bundle.get("issue", {}).get("number", ""))
+    chain_file = chain_path(issue_num)
+    if chain_file.exists():
+        actual_chain_hash = sha256_hex(chain_file.read_text())
+        if actual_chain_hash != bundle.get("chain_hash"):
+            errors.append(f"Chain hash mismatch: chain file has been modified since bundle was signed")
+        else:
+            info("Chain hash: OK")
+
+        # 5. Verify chain integrity (block linkage)
+        chain = json.loads(chain_file.read_text())
+        for i, block in enumerate(chain):
+            if i == 0:
+                if block["prev_hash"] != GENESIS_PREV_HASH:
+                    errors.append(f"Block 0: invalid genesis prev_hash")
+            else:
+                if block["prev_hash"] != chain[i - 1]["hash"]:
+                    errors.append(f"Block {i}: prev_hash does not match block {i-1} hash")
+
+            # Verify block hash
+            block_for_hash = {
+                k: v for k, v in block.items() if k not in ("hash", "signature")
+            }
+            expected_hash = sha256_hex(canonical_json(block_for_hash))
+            if expected_hash != block["hash"]:
+                errors.append(f"Block {i}: hash mismatch (block has been tampered with)")
+
+        info(f"Chain integrity: verified {len(chain)} blocks")
+    else:
+        warnings.append(f"Chain file not found ({chain_file}). Cannot verify chain integrity. "
+                        "This is normal if verifying a bundle from another repository.")
+
+    # 6. Verify artifact hashes
+    artifacts_checked = 0
+    artifacts_missing = 0
+    artifacts_tampered = 0
+    for artifact in bundle.get("artifacts", []):
+        artifact_path = Path(artifact["path"])
+        if artifact_path.exists():
+            actual_hash = sha256_file(artifact_path)
+            if actual_hash != artifact["sha256"]:
+                errors.append(f"Artifact tampered: {artifact['path']} hash mismatch")
+                artifacts_tampered += 1
+            artifacts_checked += 1
+        else:
+            warnings.append(f"Artifact not found: {artifact['path']}")
+            artifacts_missing += 1
+
+    if artifacts_checked > 0:
+        info(f"Artifacts: verified {artifacts_checked} files")
+    if artifacts_missing > 0:
+        info(f"Artifacts: {artifacts_missing} files not found (may be in a different checkout)")
+
+    # 7. Check requirement coverage
+    eval_info = bundle.get("evaluation", {})
+    eval_status = eval_info.get("status", "unknown")
+    uncovered = eval_info.get("uncovered_requirements", [])
+    if uncovered:
+        warnings.append(f"Uncovered requirements: {', '.join(uncovered)}")
+
+    # Build result
+    verified = len(errors) == 0
+    result = {
+        "verified": verified,
+        "evaluation_status": eval_status,
+        "errors": errors,
+        "warnings": warnings,
+        "artifacts_checked": artifacts_checked,
+        "artifacts_missing": artifacts_missing,
+        "artifacts_tampered": artifacts_tampered,
+    }
+    print(json.dumps(result, indent=2))
+    sys.exit(0 if verified else 1)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: summary
+# ---------------------------------------------------------------------------
+
+
+def cmd_summary(args: argparse.Namespace) -> None:
+    """Output a PR-ready summary for an issue."""
+    issue = args.issue
+    rpack_path = CHAIN_DIR / f"issue-{issue}.rpack"
+
+    if not rpack_path.exists():
+        die(f"No .rpack bundle found for issue {issue}. Run 'finalize' first.")
+
+    bundle = json.loads(rpack_path.read_text())
+    issue_info = bundle["issue"]
+    evaluation = bundle["evaluation"]
+    reqs = bundle["requirements"]
+    artifacts = bundle["artifacts"]
+
+    # Status emoji
+    status = evaluation["status"]
+    status_badge = {"pass": "PASS", "partial": "PARTIAL", "fail": "FAIL"}.get(status, "UNKNOWN")
+
+    lines = [
+        f"## ForgeProof Provenance — Issue #{issue_info['number']}",
+        "",
+        f"**Status:** {status_badge}",
+        f"**Bundle:** `.forgeproof/issue-{issue}.rpack`",
+        f"**Root Digest:** `{bundle['root_digest'][:16]}...`",
+        "",
+        "### Requirement Coverage",
+        "",
+        "| ID | Requirement | Status | Tests |",
+        "|----|-------------|--------|-------|",
+    ]
+
+    for req in reqs:
+        tests_str = ", ".join(req.get("tests", [])) or "—"
+        lines.append(f"| {req['id']} | {req['text']} | {req['status']} | {tests_str} |")
+
+    lines.extend([
+        "",
+        "### Evaluation",
+        "",
+        f"- Tests passed: {evaluation['tests_passed']}",
+        f"- Tests failed: {evaluation['tests_failed']}",
+        f"- Lint errors: {evaluation['lint_errors']}",
+        f"- Coverage: {evaluation['requirement_coverage']}",
+    ])
+
+    if evaluation.get("uncovered_requirements"):
+        lines.append(f"- Uncovered: {', '.join(evaluation['uncovered_requirements'])}")
+
+    lines.extend([
+        "",
+        "### Artifacts",
+        "",
+    ])
+    for a in artifacts:
+        lines.append(f"- `{a['path']}` ({a['operation']})")
+
+    lines.extend([
+        "",
+        "---",
+        f"*Verify: `/forgeproof-verify .forgeproof/issue-{issue}.rpack`*",
+    ])
+
+    print("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: issues
+# ---------------------------------------------------------------------------
+
+
+def cmd_issues(args: argparse.Namespace) -> None:
+    """List open GitHub issues assigned to the current user."""
+    assignee = args.assignee or "@me"
+    limit = args.limit or 20
+
+    result = run([
+        "gh", "issue", "list",
+        "--assignee", assignee,
+        "--state", "open",
+        "--limit", str(limit),
+        "--json", "number,title,labels,updatedAt,url",
+    ])
+
+    if result.returncode != 0:
+        die(f"gh issue list failed: {result.stderr.strip()}")
+
+    # Pass through the JSON output
+    print(result.stdout.strip())
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: lint
+# ---------------------------------------------------------------------------
+
+
+def cmd_lint(args: argparse.Namespace) -> None:
+    """Run the detected linter for the project."""
+    # Detect toolchain
+    detected_output = run([sys.executable, __file__, "detect"])
+    if detected_output.returncode != 0:
+        die("Could not detect project toolchain")
+
+    try:
+        detection = json.loads(detected_output.stdout)
+    except json.JSONDecodeError:
+        die("Invalid detection output")
+
+    if not detection.get("detected"):
+        die("No supported project configuration found")
+
+    # Run first available linter
+    for lang in detection.get("languages", []):
+        linter = lang.get("linter")
+        if linter and linter.get("command"):
+            cmd = linter["command"]
+            if args.quiet:
+                cmd += " --quiet 2>&1 | head -20"
+            result = shell_run(cmd)
+            print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+            sys.exit(result.returncode)
+
+    info("No linter available for this project")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: reset
+# ---------------------------------------------------------------------------
+
+
+def cmd_reset(args: argparse.Namespace) -> None:
+    """Clean up ForgeProof state for an issue or all issues."""
+    deleted = []
+
+    if getattr(args, "all", False):
+        # Delete all chains, rpacks, and ephemeral keys
+        if CHAIN_DIR.exists():
+            for f in CHAIN_DIR.glob("chain-*.json"):
+                f.unlink()
+                deleted.append(str(f))
+            for f in CHAIN_DIR.glob("issue-*.rpack"):
+                f.unlink()
+                deleted.append(str(f))
+        # Clean up temp keys
+        tmpdir = Path(tempfile.gettempdir())
+        for f in tmpdir.glob("forgeproof_*_ed25519*"):
+            f.unlink()
+            deleted.append(str(f))
+    elif args.issue:
+        issue = args.issue
+        chain = chain_path(issue)
+        if chain.exists():
+            chain.unlink()
+            deleted.append(str(chain))
+        rpack = CHAIN_DIR / f"issue-{issue}.rpack"
+        if rpack.exists():
+            rpack.unlink()
+            deleted.append(str(rpack))
+        # Clean up ephemeral key
+        key = Path(tempfile.gettempdir()) / f"forgeproof_{issue}_ed25519"
+        key.unlink(missing_ok=True)
+        Path(f"{key}.pub").unlink(missing_ok=True)
+    else:
+        die("Specify --issue N or --all")
+
+    output = {"deleted": deleted, "count": len(deleted)}
+    print(json.dumps(output, indent=2))
+    if deleted:
+        info(f"Deleted {len(deleted)} file(s)")
+    else:
+        info("Nothing to clean up")
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="forgeproof",
+        description="Ed25519-signed SHA-256 hash chain provenance engine",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # preflight
+    sub.add_parser("preflight", help="Check core dependencies")
+
+    # detect
+    p = sub.add_parser("detect", help="Detect project language and toolchain")
+    p.add_argument("--project-root", help="Project root directory (default: cwd)")
+
+    # init
+    p = sub.add_parser("init", help="Initialize chain for an issue")
+    p.add_argument("--issue", required=True, help="Issue number")
+    p.add_argument("--data", help="JSON with title and requirements")
+    p.add_argument("--force", action="store_true", help="Overwrite existing chain")
+
+    # record
+    p = sub.add_parser("record", help="Record a block in the chain")
+    p.add_argument("--issue", required=True, help="Issue number")
+    p.add_argument("--action", required=True, help="Action type")
+    p.add_argument("--data", required=True, help="JSON data for the block")
+
+    # finalize
+    p = sub.add_parser("finalize", help="Finalize chain and build .rpack")
+    p.add_argument("--issue", required=True, help="Issue number")
+    p.add_argument("--commit", required=True, help="Commit SHA")
+
+    # verify
+    p = sub.add_parser("verify", help="Verify a .rpack bundle")
+    p.add_argument("--rpack", required=True, help="Path to .rpack file")
+
+    # summary
+    p = sub.add_parser("summary", help="Output PR-ready summary")
+    p.add_argument("--issue", required=True, help="Issue number")
+
+    # issues
+    p = sub.add_parser("issues", help="List open GitHub issues")
+    p.add_argument("--assignee", default="@me", help="Assignee filter")
+    p.add_argument("--limit", type=int, default=20, help="Max issues to list")
+
+    # lint
+    p = sub.add_parser("lint", help="Run detected linter")
+    p.add_argument("--quiet", action="store_true", help="Minimal output")
+
+    # reset
+    p = sub.add_parser("reset", help="Clean up ForgeProof state")
+    p.add_argument("--issue", help="Issue number to clean up")
+    p.add_argument("--all", action="store_true", help="Clean up all issues")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "preflight": cmd_preflight,
+        "detect": cmd_detect,
+        "init": cmd_init,
+        "record": cmd_record,
+        "finalize": cmd_finalize,
+        "verify": cmd_verify,
+        "summary": cmd_summary,
+        "issues": cmd_issues,
+        "lint": cmd_lint,
+        "reset": cmd_reset,
+    }
+
+    handler = dispatch.get(args.command)
+    if handler:
+        handler(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

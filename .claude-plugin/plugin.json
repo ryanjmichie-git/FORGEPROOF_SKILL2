@@ -1,0 +1,31 @@
+{
+  "name": "forgeproof",
+  "version": "0.2.0",
+  "description": "Converts GitHub issues into working code with cryptographically signed provenance bundles. Every file edit, design decision, and test result is recorded in a tamper-evident Ed25519 hash chain. The .rpack bundle lets reviewers verify AI-generated code was not altered after creation — no external services, no API keys, pure local cryptography.",
+  "author": {
+    "name": "Ryan Michie",
+    "email": "ryanjmichie@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "provenance",
+    "audit-trail",
+    "cryptographic",
+    "ed25519",
+    "github",
+    "code-generation",
+    "compliance",
+    "security",
+    "signing",
+    "verification"
+  ],
+  "repository": "https://github.com/ryanmichie/forgeproof",
+  "homepage": "https://github.com/ryanmichie/forgeproof",
+  "bugs": "https://github.com/ryanmichie/forgeproof/issues",
+  "skills": [
+    "forgeproof",
+    "forgeproof-push",
+    "forgeproof-verify",
+    "forgeproof-reset"
+  ]
+}
