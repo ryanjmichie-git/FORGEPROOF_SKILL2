@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .ruff_cache/
+.DS_Store
+.env
 .forgeproof/ephemeral.*
 .forgeproof/last-run.json
 .forgeproof/decision-log.jsonl

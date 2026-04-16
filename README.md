@@ -4,6 +4,12 @@ Turn GitHub issues into working code with cryptographically signed provenance bu
 
 When you invoke ForgeProof, Claude reads a GitHub issue, extracts requirements, plans an implementation, writes code and tests, then packages everything into a tamper-evident `.rpack` bundle. The bundle proves what was done, why, and that nothing was altered after signing.
 
+## Installation
+
+```
+claude plugin install forgeproof
+```
+
 ## Requirements
 
 - **Python 3.11+** (stdlib only — no pip dependencies)
@@ -129,22 +135,35 @@ ForgeProof stores provenance data locally in the `.forgeproof/` directory at you
 - **Ephemeral keys are session-scoped** — The Ed25519 private key exists only in `/tmp` for the current session. If the session ends before finalization, re-run `/forgeproof` to generate a new key.
 - **No `.gitignore` enforcement** — ForgeProof warns if no `.gitignore` exists but does not create one. Ensure your project has one to avoid committing `__pycache__/` and other generated files.
 
+## Hooks (Automatic Behavior)
+
+ForgeProof registers two hooks. Both are scoped to ForgeProof workflows only — neither fires during normal sessions.
+
+- **PreToolUse** — When Claude attempts to run `gh pr create`, the hook checks for a signed `.rpack` bundle in `.forgeproof/`. If no bundle exists, the PR creation is blocked with a message directing the user to run `/forgeproof` first. This prevents unsigned PRs.
+
+- **PostToolUse** — After each `Edit` or `Write` operation, the hook runs the project's detected linter. This only fires when an active ForgeProof chain exists (`.forgeproof/chain-*.json`). Outside of ForgeProof workflows, the hook is a no-op.
+
+## Testing & Validation
+
+ForgeProof includes 38 automated tests covering:
+
+- Utility functions (SHA-256, canonical JSON determinism)
+- Chain operations (hash linkage, block structure, save/load)
+- All subcommands (init, record, finalize, verify, detect, summary, reset)
+- End-to-end integration (full pipeline with real Ed25519 signing and tamper detection)
+
+Run the test suite:
+```bash
+python -m pytest skills/forgeproof/scripts/test_forgeproof.py -v
+```
+
+Plugin validation:
+```bash
+claude plugin validate .
+```
+
+The plugin was validated end-to-end across 4 GitHub issues on a real Python project, covering bug fixes, feature additions, search functionality, and JSON serialization. All provenance bundles were verified with `/forgeproof-verify`.
+
 ## Changelog
 
-### 0.2.0
-- **Fix:** Replaced `git add -A` with explicit file staging to prevent committing `__pycache__/` and other junk
-- **Fix:** Added re-run detection — handles existing branches, remote branches, and PRs gracefully
-- **New:** `/forgeproof-reset` skill for cleaning up provenance state and branches
-- **New:** `--force` flag on `init` to overwrite existing chains
-- **New:** `reset` subcommand in the provenance engine
-- **New:** 38 tests covering all subcommands, chain integrity, verification, and E2E pipeline
-- **Improved:** Hook error messages now direct users to the correct workflow
-- **Improved:** README with re-run documentation, known limitations, and changelog
-- **Documented:** Post-rebase provenance gap in chain-format.md
-
-### 0.1.0
-- Initial release with `/forgeproof`, `/forgeproof-push`, `/forgeproof-verify`
-- Ed25519-signed SHA-256 hash chain provenance engine
-- Multi-language toolchain detection (Python, TypeScript/JavaScript, Go)
-- PreToolUse hook to gate PR creation on bundle existence
-- PostToolUse hook for linting on every file edit
+See [CHANGELOG.md](CHANGELOG.md) for version history.
